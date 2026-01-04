@@ -10,6 +10,18 @@ use regex::Regex;
 
 use crate::util::choose;
 
+fn is_reserved_windows_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    let upper = stem.to_ascii_uppercase();
+
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    )
+}
+
 /// A proposal to rename a `src` file path to a `dst` file path.
 #[derive(Clone, Debug)]
 pub struct RenameProposal {
@@ -64,11 +76,37 @@ impl RenameProposal {
     ) -> RenameProposal {
         lazy_static! {
             static ref RE_BAD_PATH_CHARS: Regex =
-                Regex::new(r"[\x00/]",).unwrap();
+                Regex::new(r#"[\x00-\x1F<>:"/\\|?*]"#,).unwrap();
         }
-        let name = RE_BAD_PATH_CHARS.replace_all(dst_name, "_");
+        let mut name = RE_BAD_PATH_CHARS
+            .replace_all(dst_name, "_")
+            .into_owned();
 
-        RenameProposal { src, dst: dst_parent.join(&*name), action }
+        // Windows forbids trailing dots or spaces in path components.
+        while name.ends_with(['.', ' ']) {
+            name.pop();
+        }
+
+        // Windows device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) are
+        // reserved regardless of extension.
+        if is_reserved_windows_name(&name) {
+            name = match name.split_once('.') {
+                Some((stem, rest)) if !rest.is_empty() => {
+                    format!("{}_.{}", stem, rest)
+                }
+                _ => {
+                    let mut adjusted = name;
+                    adjusted.push('_');
+                    adjusted
+                }
+            };
+        }
+
+        if name.is_empty() {
+            name.push('_');
+        }
+
+        RenameProposal { src, dst: dst_parent.join(name), action }
     }
 
     /// Execute this proposal according to `RenameAction`.
@@ -815,5 +853,71 @@ impl RenamerBuilder {
 impl Default for RenamerBuilder {
     fn default() -> RenamerBuilder {
         RenamerBuilder::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn sanitizes_windows_forbidden_characters() {
+        let proposal = RenameProposal::new(
+            PathBuf::from("src"),
+            Path::new("dest"),
+            "Bad:Name?with*chars",
+            RenameAction::Rename,
+        );
+
+        assert_eq!(
+            proposal.dst.file_name().unwrap().to_str().unwrap(),
+            "Bad_Name_with_chars"
+        );
+    }
+
+    #[test]
+    fn sanitizes_separators_and_quotes() {
+        let proposal = RenameProposal::new(
+            PathBuf::from("src"),
+            Path::new("dest"),
+            "Bad/\\Name\"with|pipes",
+            RenameAction::Rename,
+        );
+
+        assert_eq!(
+            proposal.dst.file_name().unwrap().to_str().unwrap(),
+            "Bad__Name_with_pipes"
+        );
+    }
+
+    #[test]
+    fn trims_trailing_spaces_and_dots() {
+        let proposal = RenameProposal::new(
+            PathBuf::from("src"),
+            Path::new("dest"),
+            "Filename.  ",
+            RenameAction::Rename,
+        );
+
+        assert_eq!(
+            proposal.dst.file_name().unwrap().to_str().unwrap(),
+            "Filename"
+        );
+    }
+
+    #[test]
+    fn avoids_reserved_windows_names() {
+        let proposal = RenameProposal::new(
+            PathBuf::from("src"),
+            Path::new("dest"),
+            "CON.txt",
+            RenameAction::Rename,
+        );
+
+        assert_eq!(
+            proposal.dst.file_name().unwrap().to_str().unwrap(),
+            "CON_.txt"
+        );
     }
 }
